@@ -1,0 +1,12 @@
+{
+  "svp_tv": "http://192.168.1.10:9900",
+  "torrserve": "http://192.168.1.10:8090",
+  "poll_seconds": 2,
+  "manager": "G:\\SVP\\SVPManager.exe",
+  "svp_local": "http://127.0.0.1:9900",
+  "tv": "http://192.168.1.20:8080",
+  "enabled": true,
+  "mode": "native_cast",
+  "lan_only": true,
+  "lan_subnet": "192.168.1.0/24"
+}

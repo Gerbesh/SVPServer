@@ -1,0 +1,14 @@
+config.json
+remote.json
+*.log
+*.exe
+*.dll
+*.apk
+*.lnk
+*.pyc
+__pycache__/
+health*.json
+pid.json
+state.json
+stop.flag
+*.tmp
