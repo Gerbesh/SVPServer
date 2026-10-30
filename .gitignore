@@ -12,3 +12,9 @@ pid.json
 state.json
 stop.flag
 *.tmp
+*.log.*
+*.lic
+Tools/
+pending-tv-options.json
+Dashboard/*self-test.json
+*.bak

@@ -18,10 +18,37 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("svp-tv-bridge")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError)
+
+
+def validate_config(config):
+    if not isinstance(config, dict):
+        raise ValueError("config.json must contain an object")
+    for key in ("tv", "torrserve", "svp_tv", "svp_local", "manager"):
+        if not isinstance(config.get(key), str) or not config[key].strip():
+            raise ValueError("Missing or empty configuration field: " + key)
+    for key in ("tv", "torrserve", "svp_tv", "svp_local"):
+        try:
+            url = urllib.parse.urlsplit(config[key])
+            if url.scheme != "http" or not url.hostname or not url.port or url.username or url.password or url.query or url.fragment or url.path not in ("", "/"):
+                raise ValueError()
+        except ValueError:
+            raise ValueError(key + " must be an HTTP URL with an explicit port")
+    if not isinstance(config.get("lan_only", True), bool):
+        raise ValueError("lan_only must be true or false")
+    if not isinstance(config.get("enabled", False), bool):
+        raise ValueError("enabled must be true or false")
+    interval = config.get("poll_seconds", 2)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 0.5 <= interval <= 60:
+        raise ValueError("poll_seconds must be between 0.5 and 60")
+    if config.get("lan_only", True) and not config.get("lan_subnet"):
+        raise ValueError("lan_subnet is required when lan_only is enabled")
+    lan_policy(config)
 
 
 def request(base, path, data=None, timeout=6):
@@ -60,9 +87,9 @@ def is_source(url, config):
         return False
     parsed = urllib.parse.urlsplit(url)
     source = urllib.parse.urlsplit(config["torrserve"])
-    return (parsed.scheme in ("http", "https") and
+    return (parsed.scheme == source.scheme and not parsed.username and not parsed.password and
             parsed.hostname == source.hostname and parsed.port == source.port and
-            parsed.path.startswith("/stream"))
+            (parsed.path == "/stream" or parsed.path.startswith("/stream/")))
 
 
 def best_route(address):
@@ -78,7 +105,7 @@ def best_route(address):
 
 
 def lan_policy(config, check_route=False):
-    if not config.get("lan_only", False):
+    if not config.get("lan_only", True):
         return
     subnet = ipaddress.ip_network(config["lan_subnet"])
     hosts = {}
@@ -132,6 +159,10 @@ class Bridge:
         self.last_error = None
         self.started_at = time.time()
         self.opened_at = None
+        self.health_last = 0
+        self.health_state = None
+        self.unparsed_since = None
+        self.unparsed_warned = False
 
     def remember(self, key, **extra):
         self.last_key = key
@@ -141,6 +172,9 @@ class Bridge:
         temp.replace(self.state_file)
 
     def health(self, reachable, phase):
+        state = (reachable, phase, self.last_error)
+        if state == self.health_state and time.monotonic() - self.health_last < 10:
+            return
         value = {"pid": os.getpid(), "heartbeat": time.time(),
                  "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                  "tv_reachable": reachable, "phase": phase,
@@ -149,31 +183,44 @@ class Bridge:
         tmp = target.with_suffix(".tmp")
         tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(target)
+        self.health_last = time.monotonic()
+        self.health_state = state
 
     def current(self):
         lan_policy(self.config, check_route=True)
         reply = request(self.tv, "/r/log?last=0", timeout=3)
         self.opened_at = latest_open_time(reply)
-        return latest_open(reply)
+        result = latest_open(reply)
+        if result[0] or not reply.get("list"):
+            self.unparsed_since = None
+            self.unparsed_warned = False
+        elif self.unparsed_since is None:
+            self.unparsed_since = time.monotonic()
+        elif not self.unparsed_warned and time.monotonic() - self.unparsed_since >= 300:
+            LOG.warning("TV log is reachable but no Open URL could be parsed for five minutes; player may be idle or its log format may have changed")
+            self.unparsed_warned = True
+        return result
 
     def ensure_manager(self):
         try:
             request(self.pc, "/r/state", timeout=2)
             return
-        except Exception:
+        except NETWORK_ERRORS:
             pass
         LOG.info("Starting installed SVP Manager")
         subprocess.Popen([self.config["manager"]], cwd=str(Path(self.config["manager"]).parent),
                          creationflags=subprocess.CREATE_NO_WINDOW,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(20):
+        for attempt in range(20):
             if (ROOT / "stop.flag").exists():
                 raise RuntimeError("Stopped")
             time.sleep(2)
             try:
                 request(self.pc, "/r/state", timeout=2)
                 return
-            except Exception:
+            except NETWORK_ERRORS:
+                if attempt in (4, 9, 14):
+                    LOG.info("Waiting for SVPcast (%s seconds)", (attempt + 1) * 2)
                 continue
         raise RuntimeError("SVPcast unavailable; enable its Web UI in SVP Manager")
 
@@ -202,15 +249,20 @@ class Bridge:
             key, _ = self.current()
             self.remember(key, status="ready")
             primed = True
-        except Exception:
+        except NETWORK_ERRORS:
             try:
                 self.last_key = json.loads(self.state_file.read_text(encoding="utf-8"))["last_event"]
-            except Exception:
+            except (OSError, ValueError, KeyError):
                 pass
+        except Exception as exc:
+            self.last_error = time.strftime("%H:%M:%S") + " " + str(exc)
+            LOG.exception("Could not initialise TV monitoring")
+            self.health(False, "error")
         LOG.info("Ready; native CastManager hand-off for NEW TorrServe playback only")
         while not (ROOT / "stop.flag").exists():
             try:
                 key, source = self.current()
+                self.last_error = None
                 self.health(True, "waiting_for_new_video")
                 if not primed:
                     primed = True
@@ -225,19 +277,24 @@ class Bridge:
                     if is_source(source, self.config):
                         for attempt in range(2):
                             try:
-                                if self.handoff(key, source):
-                                    break
+                                # A cancelled hand-off is not retried: the video changed.
+                                self.handoff(key, source)
                                 break
-                            except Exception:
+                            except NETWORK_ERRORS:
                                 self.last_error = time.strftime("%H:%M:%S") + " " + str(sys.exc_info()[1])
                                 self.health(True, "handoff_error")
                                 LOG.exception("Hand-off attempt %s failed", attempt + 1)
                                 time.sleep(3)
                                 if self.current()[0] != key:
                                     break
-            except Exception:
+            except NETWORK_ERRORS:
                 # TV off or player closed is an expected idle state.
                 self.health(False, "waiting_for_player")
+            except Exception as exc:
+                self.last_error = time.strftime("%H:%M:%S") + " " + str(exc)
+                self.health(False, "error")
+                LOG.exception("Unexpected helper error")
+                time.sleep(3)
             time.sleep(self.config.get("poll_seconds", 2))
         self.health(False, "stopped")
         LOG.info("Helper stopped; current playback left unchanged")
@@ -251,7 +308,15 @@ def main():
     if args.stop:
         (ROOT / "stop.flag").touch()
         return
-    config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    try:
+        config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        validate_config(config)
+    except (OSError, ValueError, KeyError) as exc:
+        message = "Invalid config.json: " + str(exc)
+        logging.basicConfig(filename=str(ROOT / "bridge.log"), level=logging.ERROR, encoding="utf-8")
+        LOG.error(message)
+        print(message, file=sys.stderr)
+        return 1
     if args.check:
         try:
             print("TV:", bool(request(config["tv"], "/r/log?last=0").get("ok")))
@@ -284,4 +349,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

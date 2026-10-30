@@ -17,8 +17,12 @@ using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 
 static class Data {
-    public static readonly string Root = @"G:\SVP\TVBridge";
-    public static readonly string Server = @"G:\TorrServer";
+    public static readonly string Root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,".."));
+    public static string ConfigPath(string key,string fallback) { return S(Read(Path.Combine(Root,"config.json")),key,fallback); }
+    public static string Server { get { return ConfigPath("torrserver_dir",@"G:\TorrServer"); } }
+    public static string ServerExe { get { return ConfigPath("torrserver_exe",Path.Combine(Server,"TorrServer-windows-amd64.exe")); } }
+    public static string ServerData { get { return ConfigPath("torrserver_data",Path.Combine(Server,"data-141")); } }
+    public static string Python { get { return ConfigPath("pythonw",@"G:\SVP\mpv64\pythonw.exe"); } }
     public static Dictionary<string,object> Map(object o) { return o as Dictionary<string,object> ?? new Dictionary<string,object>(); }
     public static object Get(object o,string key) { object v; return Map(o).TryGetValue(key,out v)?v:null; }
     public static string S(object o,string key,string fallback="") { object v=Get(o,key); return v==null?fallback:Convert.ToString(v); }
@@ -170,7 +174,8 @@ class MonitorBackend : IDisposable {
         if(HelperAlive()) return;
         object cfg=Data.Read(Path.Combine(Data.Root,"config.json"));
         if(Data.S(cfg,"enabled")!="True" && Data.S(cfg,"enabled")!="true") throw new Exception("Помощник выключен в config.json");
-        StartHidden(@"G:\SVP\mpv64\pythonw.exe","\""+Path.Combine(Data.Root,"bridge.py")+"\"",Data.Root);
+        if(!File.Exists(Data.Python))throw new FileNotFoundException("Не найден pythonw.exe; укажите pythonw в config.json",Data.Python);
+        StartHidden(Data.Python,"\""+Path.Combine(Data.Root,"bridge.py")+"\"",Data.Root);
     }
     public async Task EnsureCast() {
         var current=await Request(CastUrl+"/r/state");
@@ -208,17 +213,18 @@ class MonitorBackend : IDisposable {
         await EnsureCast();
     }
     public void StopServer() {
-        string exe=Path.Combine(Data.Server,"TorrServer-windows-amd64.exe");
-        foreach(var p in Process.GetProcessesByName("TorrServer-windows-amd64")) using(p) {
+        string exe=Data.ServerExe;
+        foreach(var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exe))) using(p) {
             if(!string.Equals(p.MainModule.FileName,exe,StringComparison.OrdinalIgnoreCase)) continue;
             p.Kill(); if(!p.WaitForExit(5000)) throw new Exception("TorrServe не завершился вовремя");
         }
     }
     public void StartServer() {
-        string exe=Path.Combine(Data.Server,"TorrServer-windows-amd64.exe");
-        foreach(var p in Process.GetProcessesByName("TorrServer-windows-amd64")) using(p) if(string.Equals(p.MainModule.FileName,exe,StringComparison.OrdinalIgnoreCase)) return;
+        string exe=Data.ServerExe;
+        if(!File.Exists(exe))throw new FileNotFoundException("Не найден TorrServer; укажите torrserver_exe в config.json",exe);
+        foreach(var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exe))) using(p) if(string.Equals(p.MainModule.FileName,exe,StringComparison.OrdinalIgnoreCase)) return;
         string host=new Uri(TorrUrl).Host;int port=new Uri(TorrUrl).Port;
-        StartHidden(exe,"--ip "+host+" --port "+port+" --path \""+Path.Combine(Data.Server,"data-141")+"\" --logpath \""+Path.Combine(Data.Server,"server.log")+"\"",Data.Server);
+        StartHidden(exe,"--ip "+host+" --port "+port+" --path \""+Data.ServerData+"\" --logpath \""+Path.Combine(Data.Server,"server.log")+"\"",Data.Server);
     }
     public void Dispose() { http.Dispose(); }
 }
@@ -443,7 +449,7 @@ static class Program {
         }catch(Exception ex){Data.Event("REMOTE SELF-TEST FAILED: "+ex);Environment.ExitCode=1;}
     }
     static void VerifyCaptureCleanup(){
-        using(var owner=new RemoteBackend("http://192.168.1.20:8080"))using(var child=Process.Start(new ProcessStartInfo(@"G:\SVP\mpv64\python.exe","-c \"import time;time.sleep(30)\""){UseShellExecute=false,CreateNoWindow=true,WindowStyle=ProcessWindowStyle.Hidden})){
+        using(var owner=new RemoteBackend("http://192.168.1.20:8080"))using(var child=Process.Start(new ProcessStartInfo(Path.Combine(Path.GetDirectoryName(Data.Python),"python.exe"),"-c \"import time;time.sleep(30)\""){UseShellExecute=false,CreateNoWindow=true,WindowStyle=ProcessWindowStyle.Hidden})){
             try{owner.TrackCapture(child);owner.Dispose();if(!child.WaitForExit(2000))throw new Exception("Захват не завершился вместе с владельцем");}finally{try{if(!child.HasExited)child.Kill();}catch{}}
         }
     }
