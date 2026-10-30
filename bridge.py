@@ -33,9 +33,9 @@ def request(base, path, data=None, timeout=6):
 
 def latest_open(reply):
     for line in reversed(reply.get("list", [])):
-        match = re.search(r"\[I\]: Open: ((?:https?|cast)://\S+)", line)
+        match = re.search(r"\[I\]: Open: ((?:https?|cast)://[^\r\n]+)", line)
         if match:
-            return hashlib.sha256(line.encode()).hexdigest(), html.unescape(match[1])
+            return hashlib.sha256(line.encode()).hexdigest(), html.unescape(match[1].strip())
     return None, None
 
 
@@ -117,6 +117,7 @@ def native_cast_url(source, config):
     host = server.hostname
     if ":" in host:
         host = "[" + host + "]"
+    source = urllib.parse.quote(source, safe=":/?#@!$&'()*+,;=%")
     query = urllib.parse.urlencode({"url": source}, quote_via=urllib.parse.quote)
     return urllib.parse.urlunsplit(("cast", f"{host}:{server.port}", "/", query, ""))
 
